@@ -1,0 +1,254 @@
+-- 00-generate_tensor.sql
+	-- ----------------
+	
+CREATE EXTENSION IF NOT EXISTS plperl;
+
+CREATE OR REPLACE FUNCTION generate_tensor(value INTEGER)
+RETURNS BOOLEAN[] AS $$
+	my $value = shift;
+
+	my @tensor = (
+		# this many digits or more?
+		(map { length($value) >= $_ } 1..10),
+
+		# divisible by zero?
+		$value % 10 == 0,
+	);
+
+	# map to t/f
+	grep { $_ = ($_ ? 't' : 'f') } @tensor;
+
+	return encode_typed_literal(\@tensor, 'boolean[]');
+$$ LANGUAGE plperl STRICT;
+-- 10-input.sql
+	-- ----------------
+	
+CREATE TABLE training_set(value INTEGER, training_output BOOLEAN, tensor BOOLEAN[]);
+
+WITH randint (value) AS
+(
+	SELECT (random() * (10 ^ (random() * 8 + 1)::integer))::integer
+	FROM generate_series(1, 10000)
+)
+INSERT INTO training_set SELECT value, value::text LIKE '%0%', generate_tensor(value)
+FROM randint;
+
+SELECT * FROM training_set LIMIT 10;
+-- 20-generate_weight.sql
+	-- ----------------
+	
+CREATE OR REPLACE FUNCTION generate_weight(query TEXT, desired_output BOOLEAN)
+RETURNS REAL[] AS $$
+	my $rv = spi_exec_query(shift);
+	my $status = $rv->{status};
+	my $nrows = $rv->{processed};
+
+	my $desired_output = shift;
+
+	my @success_neurons = ();
+	my @desired_neurons = ();
+	my $desired_input = 0;
+
+	foreach my $rn (0 .. $nrows - 1) {
+		my $row = $rv->{rows}[$rn];
+
+		my $tensor = $row->{(sort keys %$row)[0]};
+		my $training_output = $row->{(sort keys %$row)[1]};
+
+		# only process training rows that match our desired output
+		foreach my $neuron (0 .. $#$tensor)
+		{
+			$success_neurons[$neuron] //= 0;
+			$desired_neurons[$neuron] //= 0;
+
+			# Neuron value matches desired output value;  does
+			# the value match the desired output?
+			if ($tensor->[$neuron] eq $desired_output)
+			{
+				# Prediction success/failures that match our
+				# desired output.
+				$success_neurons[$neuron]++
+					if ($training_output eq $desired_output);
+				$desired_neurons[$neuron]++;
+			}
+		}
+		$desired_input++ if ($training_output eq $desired_output);
+	}
+
+	my @weight = ();
+	my $sum = 0;
+ 
+	# compute percentage of tests that matched requested outcome
+	foreach my $neuron (0 .. $#success_neurons) {
+		$weight[$neuron] = $desired_neurons[$neuron] != 0 ?
+			$success_neurons[$neuron] / $desired_neurons[$neuron] :
+			0;
+		$sum += $weight[$neuron];
+	}
+
+	# balance weights so they total the observed probability;
+	# this prevents an overly-predictive output value from skewing
+	# the results.
+	foreach my $neuron (0 .. $#weight) {
+		$weight[$neuron] = ($weight[$neuron] / $sum) *
+				   ($desired_input / $nrows);
+	}
+
+	return encode_typed_literal(\@weight, 'real[]');
+$$ LANGUAGE plperl STRICT;
+-- 30-tensor-weight.sql
+	-- ----------------
+	
+-- Return weights where our neuron value matches the desired output
+CREATE OR REPLACE FUNCTION tensor_mask(tensor BOOLEAN[], weight REAL[], desired_output BOOLEAN)
+RETURNS REAL[] AS $$
+	my $tensor = shift;
+	my $weight = shift;
+	my $desired_output = shift;
+
+	my @result = ();
+
+	elog(ERROR, 'tensor and weight lengths differ')
+		if ($#$tensor != $#$weight);
+
+	foreach my $i (0 .. $#$tensor) {
+		push(@result, 
+			($tensor->[$i] eq $desired_output) ?
+			$weight->[$i] : 0);
+	}
+
+	return encode_typed_literal(\@result, 'real[]');
+$$ LANGUAGE plperl STRICT;
+-- 35-sum-weight.sql
+	-- ----------------
+	
+CREATE OR REPLACE FUNCTION sum_weight(weight REAL[])
+RETURNS REAL AS $$
+	my $weight = shift;
+	my $sum = 0;
+
+	# sum weights
+	foreach my $i (0 .. $#$weight) {
+		$sum += $weight->[$i];
+	}
+
+	return encode_typed_literal($sum, 'real');
+$$ LANGUAGE plperl STRICT;
+-- 40-softmax.sql
+	-- ----------------
+	
+-- Normalize the values so the probabilities total one
+CREATE OR REPLACE FUNCTION softmax(val1 REAL, val2 REAL)
+RETURNS REAL[] AS $$
+	my $val1 = shift;
+	my $val2 = shift;
+	my $sum = $val1 + $val2;
+
+	# What percentge is each of the total?
+	my @result = (
+		$val1 / $sum,
+		$val2 / $sum,
+	);
+
+	return encode_typed_literal(\@result, 'real[]');
+$$ LANGUAGE plperl STRICT;
+-- 50-demo.sql
+	-- ----------------
+	
+CREATE TABLE tensor_weight_true AS
+SELECT generate_weight('SELECT tensor AS x1, training_output AS x2 FROM training_set', true) AS weight;
+
+CREATE TABLE tensor_weight_false AS
+SELECT generate_weight('SELECT tensor AS x1, training_output AS x2 FROM training_set', false) AS weight;
+
+SELECT * FROM tensor_weight_true;
+
+SELECT * FROM tensor_weight_false;
+
+WITH test_set (checkval) AS 
+(
+	SELECT 100
+)
+SELECT softmax(
+	sum_weight(
+		tensor_mask(
+			generate_tensor(checkval),
+			tensor_weight_true.weight,
+			true)),
+	sum_weight(
+		tensor_mask(
+			generate_tensor(checkval),
+			tensor_weight_false.weight,
+			false))
+)
+FROM test_set, tensor_weight_true, tensor_weight_false;
+
+WITH test_set (checkval) AS
+(
+	SELECT 101
+)
+SELECT softmax(
+	sum_weight(
+		tensor_mask(
+			generate_tensor(checkval),
+			tensor_weight_true.weight,
+			true)),
+	sum_weight(
+		tensor_mask(
+			generate_tensor(checkval),
+			tensor_weight_false.weight,
+			false))
+)
+FROM test_set, tensor_weight_true, tensor_weight_false;
+
+WITH test_set (checkval) AS
+(
+	SELECT 487234987
+)
+SELECT softmax(
+	sum_weight(
+		tensor_mask(
+			generate_tensor(checkval),
+			tensor_weight_true.weight,
+			true)),
+	sum_weight(
+		tensor_mask(
+			generate_tensor(checkval),
+			tensor_weight_false.weight,
+			false))
+)
+FROM test_set, tensor_weight_true, tensor_weight_false;
+
+WITH test_set (checkval) AS
+(
+	SELECT (random() * (10 ^ (random() * 8 + 1)::integer))::integer
+        FROM generate_series(1, 1000)
+),
+ai (checkval, output_layer) AS 
+(
+	SELECT checkval, softmax(
+		sum_weight(tensor_mask(generate_tensor(checkval),
+			   tensor_weight_true.weight, true)),
+		sum_weight(tensor_mask(generate_tensor(checkval),
+			   tensor_weight_false.weight, false))
+	)
+	FROM test_set, tensor_weight_true, tensor_weight_false
+),
+analysis (checkval, cmp_bool, output_layer, accuracy) AS
+(
+	SELECT checkval, checkval::text LIKE '%0%', output_layer,
+		CASE checkval::text LIKE '%0%'
+		-- higher/lower than random chance
+		WHEN true THEN output_layer[1] - 0.5
+		ELSE output_layer[2] - 0.5
+		END
+	FROM ai
+)
+SELECT * FROM analysis
+UNION ALL
+SELECT NULL, NULL, NULL, AVG(accuracy)
+FROM analysis
+UNION ALL
+SELECT NULL, NULL, NULL, SUM(CASE WHEN accuracy > 0 THEN 1 END)::REAL/COUNT(*)
+FROM analysis;
+
